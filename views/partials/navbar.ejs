@@ -1,0 +1,24 @@
+<header class="sticky top-0 z-30 border-b border-white/6 bg-black/60 backdrop-blur-xl">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <div class="flex items-center gap-3 h-16">
+      <!-- Logo -->
+      <a href="/" class="flex items-center gap-2.5 flex-shrink-0 group">
+        <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center text-black font-black text-sm shadow-lg shadow-amber-500/25 group-hover:scale-105 transition-transform">
+          ◈
+        </div>
+        <span class="font-display font-bold text-lg text-white tracking-tight hidden sm:block">Bazaar</span>
+      </a>
+
+      <!-- Search (center, grows) -->
+      <div class="flex-1 mx-2 sm:mx-6 max-w-xl">
+        <search-bar></search-bar>
+      </div>
+
+      <!-- Actions -->
+      <div class="flex items-center gap-2 flex-shrink-0">
+        <list-item-modal></list-item-modal>
+        <auth-modal></auth-modal>
+      </div>
+    </div>
+  </div>
+</header>

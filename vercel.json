@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "buildCommand": "npm run build",
+  "outputDirectory": "public",
+  "functions": {
+    "api/index.ts": {
+      "memory": 512,
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    { "source": "/dist/:path*", "destination": "/dist/:path*" },
+    { "source": "/(.*)",        "destination": "/api/index.ts" }
+  ]
+}
