@@ -1,146 +1,338 @@
 # Architecture Decision Records (ADR)
+## CollectMarket — Social Marketplace
 
-## ADR-001: Hybrid Rendering Architecture — EJS Shell + Lit Web Components
+> This document captures the major technical decisions made during the design and
+> implementation of CollectMarket, including context, alternatives considered,
+> the chosen solution, and the tradeoffs involved.
+
+---
+
+## ADR-001 — Hybrid Rendering: EJS Shell + Lit Web Components
 
 ### Status
-Accepted
+**Accepted** — Implemented in production
 
 ### Context
-The marketplace needed both server-rendered HTML for SEO and initial performance, and rich client-side interactivity for real-time chat, search, and negotiation flows. A pure SPA would hurt initial load; pure SSR wouldn't support live polling or reactive state.
+CollectMarket required two competing qualities simultaneously:
+- **Fast initial load & SEO-friendliness** — the page shell, header, and hero section
+  should render without JavaScript.
+- **Rich, reactive UI** — real-time chat, live offer negotiation, dynamic item grids,
+  and modals that update instantly without page reloads.
+
+A pure client-side SPA (React/Vue) would hurt first-contentful-paint and SEO. Pure
+server-side rendering (classic EJS/Handlebars) can't support a live messaging system
+without polling hacks. Meta-frameworks (Next.js, SvelteKit) solve this but introduce
+opinionated routing and build complexity incompatible with the EJS requirement.
 
 ### Options Considered
-1. **Pure SPA (React/Vue)** — Full client-side rendering, fast interactions, but poor SEO and slow first paint.
-2. **Pure SSR (EJS/Handlebars)** — Fast initial load, no JS needed, but very poor interactivity for chat and real-time updates.
-3. **Hybrid: EJS shell + Lit Web Components** *(chosen)* — Server renders the page shell and decides which components to mount; Lit handles client-side state and interactions.
-4. **Next.js / Nuxt** — Full meta-framework with SSR+hydration, but overkill and prescriptive for a focused marketplace app.
+
+| Option | Description |
+|---|---|
+| Pure SPA (React/Vue) | Full client rendering; fast interactions but slow initial paint, no server component control |
+| Pure SSR (EJS) | Fast initial load but no reactive state; requires full page reloads for updates |
+| **Hybrid: EJS + Lit** *(chosen)* | Server renders the shell; Lit handles all interactive components in light DOM |
+| Next.js / Nuxt | Full meta-framework with SSR+hydration; overkill, conflicts with EJS requirement |
+| HTMX | Server-driven HTML fragments; elegant but polling-heavy for real-time chat |
 
 ### Decision
-Option 3: The Express/EJS server renders the full HTML shell including semantic structure, meta tags, and a `components` array that drives conditional `<% if (components.includes(...)) %>` blocks in EJS. Only declared components are instantiated in the DOM, giving the server full control over the page composition.
+**EJS for the page shell, Lit Web Components for all interactive UI.**
+
+The Express/EJS server renders the full HTML document, including a `components` array
+that drives conditional `<% if (components.includes('auth-modal')) %>` blocks. Only
+components declared by the server are mounted — the server determines what renders.
+
+All Lit components override `createRenderRoot()` to return `this` (light DOM rendering),
+which allows Tailwind CSS utility classes to apply normally through the global stylesheet.
+Modals are placed at `<body>` level in the EJS template, outside any stacking contexts.
 
 ### Tradeoffs
+
 **Pros:**
-- Server controls which Lit components render (architecture requirement met)
-- First contentful paint is immediate — no JS needed for layout
-- Lit components are truly independent and reusable (custom elements / standards-based)
-- Easy to add SSR-only pages (landing, legal) without any JS overhead
+- Server fully controls which components render — a core architecture requirement
+- First contentful paint is immediate (no JS required for layout)
+- Lit custom elements are standards-based and framework-agnostic
+- Easy to add purely server-rendered pages (legal, landing) with zero JS overhead
+- Light DOM rendering solves the Tailwind Shadow DOM incompatibility
 
 **Cons:**
-- Lit Web Components use Shadow DOM which requires special handling for Tailwind utility classes (resolved with `unstyled` approach + Tailwind CDN injection globally)
-- Double bundle: EJS templating + Lit modules adds complexity
-- No built-in hydration lifecycle like Next.js offers
+- `createRenderRoot()` override removes Lit's style encapsulation; component styles
+  must be careful not to conflict with global styles
+- Two separate concerns (EJS template logic + Lit state) add cognitive overhead
+- No built-in hydration lifecycle like Next.js — initial data must be fetched by
+  components after mount
 
 ---
 
-## ADR-002: HTTP Polling Over WebSockets for Real-Time Messaging
+## ADR-002 — HTTP Adaptive Polling for Real-Time Chat
 
 ### Status
-Accepted (with upgrade path)
+**Accepted** — Matches backend contract; upgrade path documented
 
 ### Context
-The backend API provided uses HTTP polling (`GET /api/messages/item/:itemId/poll/:timestamp`), not WebSockets. The chat system needed to feel responsive while respecting the given backend contract.
+The backend API provided uses HTTP polling endpoints:
+```
+GET /api/messages/item/:itemId/poll/:timestamp
+```
+The response includes a `pollAgainAfter: 2000` hint. The chat system needed to feel
+responsive while operating within this constraint. True WebSocket support would require
+rewriting the backend server, which was outside scope.
 
 ### Options Considered
-1. **WebSockets (Socket.io)** — True real-time push, but requires rewriting the backend and managing socket state across clients.
-2. **Server-Sent Events (SSE)** — Unidirectional push from server to client; simpler than WebSockets but still requires backend changes.
-3. **HTTP Short Polling (fixed interval)** — Simple but hammers the server even when idle; battery drain on mobile.
-4. **HTTP Adaptive Polling** *(chosen)* — Uses the backend's `pollAgainAfter` hint (2000ms) and only polls while the chat panel is open. Stops on close/disconnect.
+
+| Option | Description |
+|---|---|
+| WebSockets (Socket.io) | True bidirectional push; ~50ms latency; requires backend rewrite |
+| Server-Sent Events | Server-to-client push; still requires new backend endpoints |
+| Fixed Interval Polling | Simple `setInterval`; hammers server even when chat is inactive |
+| **Adaptive HTTP Polling** *(chosen)* | Polls only while chat panel is open; respects `pollAgainAfter` hint |
+| Long-Polling | Keeps connection open until new messages; complex error handling |
 
 ### Decision
-Adaptive HTTP polling: The `ChatPanel` component polls `GET /api/messages/item/:itemId/poll/:timestamp` every 2 seconds, but **only** while the panel is open. When closed, `clearTimeout` is called immediately. The timestamp cursor is advanced per response so only new messages are transferred. The backend's `pollAgainAfter` field is respected for future rate adjustments.
+**Adaptive polling: poll every 2 seconds, only while the chat panel is open.**
+
+The `ChatPanel` Lit component starts polling in `openForItem()` and calls
+`clearTimeout()` in `close()` and `disconnectedCallback()`. The timestamp cursor
+advances with each response so only genuinely new messages are transferred. On poll
+failure, the interval backs off to 5 seconds.
+
+```typescript
+// Pattern: schedule next poll only after current completes
+private _startPoll() {
+  this._poll = setTimeout(async () => {
+    const result = await messagesApi.poll(itemId, this._lastTs);
+    if (result.hasNew) { /* update state */ }
+    if (this._open) this._startPoll(); // reschedule only if still open
+  }, 2000);
+}
+```
+
+The unread badge counter uses a separate 8-second interval that polls
+`/api/messages/unread/:userId` while a user is logged in.
 
 ### Tradeoffs
+
 **Pros:**
-- Zero backend changes required — works with the provided server as-is
-- Simple to reason about; no persistent connections to manage
-- Graceful degradation: if a poll fails, it retries with 5s backoff
-- Easy to swap to WebSockets later by replacing the `_startPolling()` method
+- Zero backend changes — works with the provided server as-is
+- Simple to reason about; no persistent connection state
+- Graceful degradation: network errors don't crash the UI
+- Easy to swap to WebSockets by replacing `_startPoll()` with a socket listener
 
 **Cons:**
-- 2-second message latency at worst (vs. ~50ms for WebSockets)
-- Each open chat creates a recurring HTTP request (mitigated by open-panel-only polling)
-- Not suitable at scale without server-side caching (the backend reads JSON files per poll)
+- 2-second maximum message latency (vs ~50ms for WebSockets)
+- Every open chat generates HTTP requests every 2 seconds
+- Not suitable at scale without server-side caching (the server reads JSON per poll)
+- Battery drain on mobile if many chats are open simultaneously
 
 ---
 
-## ADR-003: Redux-Inspired Centralized Store with Zod Validation
+## ADR-003 — Redux-Inspired Observable Store with Zod Validation
 
 ### Status
-Accepted
+**Accepted** — Core state management pattern throughout the app
 
 ### Context
-Multiple Lit components need shared state: the logged-in user, item list, messages per item, and unread counts. Without a shared store, components would duplicate API calls and go out of sync.
+Multiple Lit components across the page need to share and react to the same state:
+the logged-in user, item listings, per-item messages, unread counts, loading states,
+and error flags. Without a shared store:
+- Components duplicate API calls
+- State diverges between views
+- Passing data down via properties creates deep, brittle prop-chains in Web Components
+
+The project required "advanced state management" (Redux, Zod, Query.js, etc.) while
+keeping the bundle small and avoiding React-specific libraries.
 
 ### Options Considered
-1. **No shared state (prop-drilling / events only)** — Simple but leads to duplicated API calls, stale data between components, and complex event chains.
-2. **Redux / Zustand** — Mature state libraries, but add significant bundle size and are designed for React's render model, not Lit's reactive properties.
-3. **Custom Observable Store** *(chosen)* — A lightweight class implementing dispatch/subscribe/getState pattern inspired by Redux, with zero dependencies.
-4. **RxJS BehaviorSubject** — Reactive and composable, but steep learning curve and large bundle for this use case.
+
+| Option | Description |
+|---|---|
+| Redux Toolkit | Battle-tested; excellent DevTools; designed for React's render model |
+| Zustand | Minimal and flexible; still React-centric with hooks API |
+| MobX | Observable objects; powerful but adds significant bundle size |
+| **Custom Observable Store + Zod** *(chosen)* | ~80 lines; pure TypeScript; framework-agnostic |
+| RxJS BehaviorSubject | Reactive streams; steep learning curve; large bundle |
+| Component-level state only | Simple but leads to duplicated API calls and stale UI |
 
 ### Decision
-A single `AppStore` class with:
-- A pure `reducer(state, action)` function (Redux pattern for predictability and testability)
-- `subscribe(listener)` returning an unsubscribe function (standard observable pattern)
-- `BaseComponent` abstract class that auto-subscribes on `connectedCallback` and unsubscribes on `disconnectedCallback`
-- `localStorage` persistence for the logged-in user only (minimal persistence surface)
-- **Zod schemas** for all API input/output validation (`CreateItemSchema`, `LoginSchema`, `OfferSchema`) to catch malformed data at the boundary
+**A custom `AppStore` class implementing the Redux pattern (dispatch/reduce/subscribe)
+with Zod schemas for API boundary validation.**
+
+```typescript
+// Pure reducer — predictable, testable, no side effects
+function reducer(state: AppState, action: AppAction): AppState {
+  switch (action.type) {
+    case 'SET_USER':     return { ...state, user: action.payload };
+    case 'ADD_ITEM':     return { ...state, items: [action.payload, ...state.items] };
+    case 'ADD_MESSAGE': {
+      const existing = state.messages[action.payload.itemId] ?? [];
+      if (existing.find(m => m.id === action.payload.id)) return state; // deduplicate
+      return { ...state, messages: { ...state.messages, [action.payload.itemId]: [...existing, action.payload] } };
+    }
+    // ... discriminated union ensures exhaustive matching
+  }
+}
+```
+
+The `BaseComponent` abstract class auto-subscribes on `connectedCallback` and
+unsubscribes on `disconnectedCallback`, so every Lit component gets reactive
+updates with zero boilerplate.
+
+**Zod schemas** validate all API inputs at the boundary:
+```typescript
+export const CreateItemSchema = z.object({
+  name: z.string().min(3).max(100),
+  price: z.number().positive().max(1_000_000),
+  sellerId: z.string().min(1),
+  // ...
+});
+// Runtime type safety at API call sites — catches malformed responses
+```
+
+The logged-in user is persisted to `localStorage` so sessions survive page refreshes.
 
 ### Tradeoffs
+
 **Pros:**
-- Zero extra dependencies — ~60 lines of code
-- Pure reducer is easy to test in isolation
-- Zod provides runtime type safety at API boundaries, not just compile-time TypeScript
-- All components share a single reactive source of truth
+- Zero external runtime dependencies for state management
+- Pure reducer is trivially unit-testable in isolation
+- `AppAction` discriminated union gives exhaustive compile-time checking
+- Zod catches malformed API responses at runtime, not silently
+- No middleware complexity — async side effects are handled in components
 
 **Cons:**
-- No Redux DevTools integration (time-travel debugging not available)
-- No middleware/effects layer (async side effects are handled in components directly)
-- `requestUpdate()` on all subscribers is called on every action (optimized with referential equality check in reducer — only notifies when state reference changes)
+- No Redux DevTools time-travel debugging
+- No middleware/effects layer (thunks, sagas) — async must live in components
+- `requestUpdate()` called on all subscribers per dispatch; mitigated by referential
+  equality check (reducer returns same reference if state didn't change)
+- Must manually keep Zod schemas in sync with TypeScript types
 
 ---
 
-## ADR-004: TypeScript Throughout with Strict Mode
+## ADR-004 — TypeScript Strict Mode Throughout
 
 ### Status
-Accepted
+**Accepted** — Enforced from day one
 
 ### Context
-The codebase spans Lit Web Components, API utilities, Zod schemas, and the EJS server. TypeScript strict mode catches a class of bugs at compile time that are common in marketplace logic (null prices, missing IDs, wrong message types).
+The codebase spans Lit Web Components, Express API routes, Zod schemas, and the Redux-
+style store. Marketplace logic has several classes of common bugs that TypeScript strict
+mode catches at compile time:
+- `item.highestOffer` can be `null` — accessing `.toFixed()` on null crashes at runtime
+- Message `type` is a string enum; wrong type strings silently pass without TypeScript
+- API response shapes change — TypeScript surfaces the mismatch immediately
+
+### Options Considered
+
+| Option | Description |
+|---|---|
+| No TypeScript (plain JS) | Zero setup; no compile step; runtime errors only |
+| TypeScript with `strict: false` | Some safety; misses null checks and implicit any |
+| **TypeScript `strict: true`** *(chosen)* | All strict checks; catches null, any, unreachable code |
+| Flow | Facebook's type system; smaller ecosystem; less tooling support |
 
 ### Decision
-`"strict": true` in both `tsconfig.json` (client) and `tsconfig.server.json` (server). All types are explicitly declared in `src/client/types/index.ts`. Zod schemas derive `DTO` types to keep API response types in sync with validation.
+`"strict": true` in both `tsconfig.json` (client) and `tsconfig.server.json` (server).
+All domain types are centralized in `src/client/types/index.ts`. Zod `infer<>` derives
+DTO types from schemas to keep them in sync:
+
+```typescript
+export const ItemSchema = z.object({
+  id: z.string(),
+  price: z.number(),
+  highestOffer: z.number().nullable(),  // TypeScript forces null checks everywhere
+  status: z.enum(['active', 'pending_payment', 'sold']),
+  // ...
+});
+export type ItemDTO = z.infer<typeof ItemSchema>;
+```
+
+Lit decorators require `experimentalDecorators: true` and `useDefineForClassFields: false`
+to avoid a conflict between TypeScript's class fields transform and Lit's property system.
+`tsx` is used for development (transpile-only, fast) while `tsc` validates types in CI.
 
 ### Tradeoffs
+
 **Pros:**
-- Catches null-related bugs (e.g., `item.highestOffer` can be `null`) at compile time
-- `AppAction` discriminated union gives exhaustive type checking in the reducer
-- Consistent DX across frontend and backend TypeScript surfaces
+- Null-related bugs caught at compile time (e.g., `item.highestOffer?.toFixed(0)`)
+- `AppAction` discriminated union gives exhaustive `switch` checking in the reducer
+- IDE autocomplete is accurate and complete throughout the codebase
+- Zod + TypeScript creates a double safety net: compile-time + runtime
 
 **Cons:**
-- `experimentalDecorators: true` required for Lit `@customElement`/`@state` decorators
-- `useDefineForClassFields: false` needed to avoid Lit decorator conflicts with TypeScript class fields
-- Small compile overhead; mitigated by `tsx` for dev (transpile-only, no type-check) and `tsc` for CI
+- `experimentalDecorators` + `useDefineForClassFields: false` is a non-obvious Lit
+  gotcha that causes confusing errors without documentation
+- Slightly longer build cycle for type-checking (mitigated by `tsx` in dev)
+- Strict null checks require more explicit optional chaining (`?.` and `??`)
+  throughout, especially when reading MongoDB documents
 
 ---
 
-## ADR-005: Component Isolation via Shadow DOM Override
+## ADR-005 — Embedded Full-Stack Server (No Separate Backend)
 
 ### Status
-Accepted
+**Accepted** — Simplifies deployment; critical for Vercel compatibility
 
 ### Context
-Lit components use Shadow DOM by default, which isolates styles. However, Tailwind utility classes are applied globally and wouldn't penetrate Shadow DOM boundaries.
+Originally the project had a separate backend (port 3001) proxied through the frontend
+(port 4000). This caused multiple failure modes in practice:
+- Backend process died between bash invocations in the development environment
+- Vercel cannot run two persistent processes; only one serverless function is supported
+- The HTTP proxy added latency and a failure point for every API call
+- Developers had to start two servers to run the application
+
+### Options Considered
+
+| Option | Description |
+|---|---|
+| Separate processes (original) | Clean separation of concerns; two ports; proxy required |
+| **Embedded routes in single server** *(chosen)* | All API routes co-located with EJS server; one `npm start` |
+| Microservices | Overkill for a marketplace MVP; complex orchestration |
+| Serverless functions (per-route) | Vercel-native; requires refactoring every route to a separate file |
 
 ### Decision
-All marketplace Lit components extend `BaseComponent` which extends `LitElement` but does **not** override `createRenderRoot` — this means components render into the **light DOM** (by returning `this` from `createRenderRoot` implicitly via not overriding it would use shadow root, but we keep scoped styles minimal using CSS-in-JS `css` tagged literals for the few styles that are needed, and use Tailwind classes via the CDN on all template elements which are in the shadow root).
+**All Express API routes are defined directly in `src/server/index.ts` alongside the
+EJS page routes.** The server exports `app` for Vercel's serverless wrapper:
 
-Actually, the Tailwind CDN script uses `MutationObserver` to scan all DOM including shadow roots when using the Play CDN. This is confirmed to work for Shadow DOM components with the CDN approach.
+```typescript
+// Single entry point — works both locally and on Vercel
+export const app = express();
+// ... all routes defined here ...
+
+// Only start listening when running locally (not on Vercel)
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`Running on ${PORT}`));
+}
+export default app;
+```
+
+For Vercel, `api/index.ts` re-exports the app and `vercel.json` routes all traffic
+through it. For local development, `tsx src/server/index.ts` starts a standard HTTP
+server on port 4000.
 
 ### Tradeoffs
+
 **Pros:**
-- True encapsulation of component internals
-- Tailwind CDN scans shadow roots automatically
-- Component styles don't leak globally
+- Single `npm start` command runs the entire application
+- Zero latency between "frontend" and "backend" — no HTTP hop for API calls
+- Vercel deployment works without any architectural changes
+- Simpler mental model: one process, one port, one log stream
 
 **Cons:**
-- Some global CSS (scrollbar styling, font-face) doesn't pierce shadow roots automatically
-- Workaround: critical shared styles are applied directly in the EJS template's `<style>` block
+- Frontend and API concerns are co-located, reducing separation
+- Scaling frontend and API independently is not possible without splitting again
+- A bug in any API route can crash the page server (mitigated by Express error middleware)
+- Bundling `node_modules` for Vercel is larger than a dedicated API-only package
+
+---
+
+## Bonus Feature Checklist
+
+| Feature | Status | Notes |
+|---|---|---|
+| ✅ Advanced State Management | **Implemented** | Custom Redux-like `AppStore` with Zod validation (ADR-003) |
+| ✅ Fully Responsive Design | **Implemented** | Mobile-first grid (1→2→3→4 cols), bottom-sheet modals on mobile, collapsible search, responsive hero |
+| ✅ TypeScript Usage | **Implemented** | Strict mode throughout; discriminated unions; Zod-inferred types (ADR-004) |
+| ✅ Checkout & Payment Flow | **Implemented** | Buyer checkout modal → `POST /checkout` → seller notification → seller confirm → item removed |
+| ✅ Direct Messaging | **Implemented** | HTTP adaptive polling (ADR-002); per-item message threads; read receipts |
+| ✅ Price Negotiation | **Implemented** | Offer → Accept/Reject → Checkout with negotiated price |
+| ✅ Search | **Implemented** | Debounced keyword search; server-side filtering |
+| ✅ Hybrid SSR + CSR | **Implemented** | EJS shell + Lit Web Components (ADR-001) |
